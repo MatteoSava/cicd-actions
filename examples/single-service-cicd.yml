@@ -1,0 +1,74 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Example: Single Service CI/CD
+# ═══════════════════════════════════════════════════════════════════════════════
+# For repos with a single service/app. Simpler than monorepo setup.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/${{ github.repository }}  # e.g., ghcr.io/owner/repo
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate tags
+        id: meta
+        uses: MatteoSava/cicd-actions/actions/docker-metadata@main
+        with:
+          image_name: ${{ env.IMAGE_NAME }}
+
+      - name: Build and push
+        uses: MatteoSava/cicd-actions/actions/docker-build@main
+        with:
+          context: .
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: ${{ github.event_name != 'pull_request' }}
+          registry: ${{ env.REGISTRY }}
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+          build_args: |
+            VERSION=${{ github.sha }}
+
+  # Optional: Multi-platform build for releases
+  build-multiplatform:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate tags
+        id: meta
+        uses: MatteoSava/cicd-actions/actions/docker-metadata@main
+        with:
+          image_name: ${{ env.IMAGE_NAME }}
+
+      - name: Build multi-platform
+        uses: MatteoSava/cicd-actions/actions/docker-build@main
+        with:
+          context: .
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          registry: ${{ env.REGISTRY }}
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}

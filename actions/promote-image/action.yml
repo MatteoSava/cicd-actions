@@ -1,0 +1,126 @@
+name: 'Promote Image'
+description: 'Retag and push image for environment promotion (dev → staging → prod)'
+author: 'Matteo Sava'
+
+branding:
+  icon: 'arrow-up-circle'
+  color: 'green'
+
+inputs:
+  # ═══════════════════════════════════════════════════════════════
+  # Source & Target
+  # ═══════════════════════════════════════════════════════════════
+  source_tag:
+    description: 'Full source image tag (e.g., ghcr.io/owner/app:main-abc1234)'
+    required: true
+  target_tag:
+    description: 'Full target image tag (e.g., ghcr.io/owner/app:staging-abc1234)'
+    required: true
+  additional_tags:
+    description: 'Additional tags to apply (newline separated)'
+    required: false
+    default: ''
+
+  # ═══════════════════════════════════════════════════════════════
+  # Registry Configuration
+  # ═══════════════════════════════════════════════════════════════
+  registry:
+    description: 'Registry for login'
+    required: false
+    default: 'ghcr.io'
+  registry_username:
+    description: 'Registry username'
+    required: true
+  registry_password:
+    description: 'Registry password/token'
+    required: true
+
+  # ═══════════════════════════════════════════════════════════════
+  # Options
+  # ═══════════════════════════════════════════════════════════════
+  fail_if_missing:
+    description: 'Fail if source image does not exist'
+    required: false
+    default: 'false'
+
+outputs:
+  promoted:
+    description: 'True if promotion succeeded'
+    value: ${{ steps.promote.outputs.promoted }}
+  digest:
+    description: 'Digest of promoted image'
+    value: ${{ steps.promote.outputs.digest }}
+  all_tags:
+    description: 'All tags applied (newline separated)'
+    value: ${{ steps.promote.outputs.all_tags }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Login to registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry_username }}
+        password: ${{ inputs.registry_password }}
+
+    - name: Promote image
+      id: promote
+      shell: bash
+      run: |
+        set -euo pipefail
+        
+        SOURCE="${{ inputs.source_tag }}"
+        TARGET="${{ inputs.target_tag }}"
+        FAIL_IF_MISSING="${{ inputs.fail_if_missing }}"
+        
+        echo "🔄 Promoting image"
+        echo "   Source: ${SOURCE}"
+        echo "   Target: ${TARGET}"
+        
+        # Try to pull source image
+        if ! docker pull "${SOURCE}" 2>/dev/null; then
+          if [[ "$FAIL_IF_MISSING" == "true" ]]; then
+            echo "❌ Source image not found: ${SOURCE}"
+            exit 1
+          else
+            echo "⚠️ Source image not found, skipping promotion"
+            echo "promoted=false" >> $GITHUB_OUTPUT
+            echo "digest=" >> $GITHUB_OUTPUT
+            echo "all_tags=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+        fi
+        
+        # Get digest
+        DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${SOURCE}" | cut -d@ -f2)
+        
+        # Collect all target tags
+        ALL_TAGS="${TARGET}"
+        
+        # Apply primary target tag
+        docker tag "${SOURCE}" "${TARGET}"
+        docker push "${TARGET}"
+        
+        # Apply additional tags
+        ADDITIONAL='${{ inputs.additional_tags }}'
+        if [[ -n "$ADDITIONAL" ]]; then
+          while IFS= read -r tag; do
+            [[ -z "$tag" ]] && continue
+            echo "   Adding tag: ${tag}"
+            docker tag "${SOURCE}" "${tag}"
+            docker push "${tag}"
+            ALL_TAGS="${ALL_TAGS}"$'\n'"${tag}"
+          done <<< "$ADDITIONAL"
+        fi
+        
+        echo "promoted=true" >> $GITHUB_OUTPUT
+        echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+        {
+          echo "all_tags<<EOF"
+          echo "${ALL_TAGS}"
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
+        
+        echo "✅ Promotion complete"
+        echo "   Digest: ${DIGEST}"

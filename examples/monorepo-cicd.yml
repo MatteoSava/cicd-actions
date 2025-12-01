@@ -1,0 +1,109 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Example: Monorepo CI/CD
+# ═══════════════════════════════════════════════════════════════════════════════
+# Copy this to your monorepo's .github/workflows/ci.yml
+# Adjust services, paths, and image names to match your structure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Detect which services changed
+  # ─────────────────────────────────────────────────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      any_changed: ${{ steps.detect.outputs.any_changed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changes
+        id: detect
+        uses: MatteoSava/cicd-actions/actions/detect-changes@main
+        with:
+          # Define your services and their paths
+          services: |
+            {
+              "api": ["backend/**", "proto/**"],
+              "web": ["frontend/**"],
+              "worker": ["worker/**"]
+            }
+          # Paths that trigger ALL services
+          shared_paths: '["shared/**", ".github/**"]'
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Build & Push Docker Images
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    needs: changes
+    # Build if: changes detected OR release tag
+    if: needs.changes.outputs.any_changed == 'true' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.changes.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate tags
+        id: meta
+        uses: MatteoSava/cicd-actions/actions/docker-metadata@main
+        with:
+          image_name: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+
+      - name: Build and push
+        uses: MatteoSava/cicd-actions/actions/docker-build@main
+        with:
+          context: services/${{ matrix.service }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: ${{ github.event_name != 'pull_request' }}
+          registry: ${{ env.REGISTRY }}
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+          cache_key: ${{ matrix.service }}
+          build_args: |
+            VERSION=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Promote to Staging (on main branch)
+  # ─────────────────────────────────────────────────────────────────────────────
+  promote-staging:
+    needs: [changes, build]
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.any_changed == 'true'
+    runs-on: ubuntu-latest
+    environment: staging  # Requires approval in GitHub settings
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.changes.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Promote to staging
+        uses: MatteoSava/cicd-actions/actions/promote-image@main
+        with:
+          source_tag: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:main-${{ github.sha }}
+          target_tag: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:staging-${{ github.sha }}
+          registry: ${{ env.REGISTRY }}
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}

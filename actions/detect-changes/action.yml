@@ -1,0 +1,108 @@
+name: 'Detect Monorepo Changes'
+description: 'Detect which services changed in a monorepo based on path filters'
+author: 'Matteo Sava'
+
+branding:
+  icon: 'git-branch'
+  color: 'blue'
+
+inputs:
+  services:
+    description: |
+      JSON object mapping service names to their paths.
+      Example: {"api": ["backend/**"], "web": ["frontend/**"]}
+    required: true
+  shared_paths:
+    description: |
+      JSON array of paths that trigger ALL services when changed.
+      Example: ["shared/**", ".github/**"]
+    required: false
+    default: '[]'
+  base_ref:
+    description: 'Base ref for comparison (default: auto-detect)'
+    required: false
+    default: ''
+
+outputs:
+  matrix:
+    description: 'JSON array of changed service names for matrix strategy'
+    value: ${{ steps.build-matrix.outputs.matrix }}
+  services_json:
+    description: 'JSON object with service: boolean for each service'
+    value: ${{ steps.build-matrix.outputs.services_json }}
+  any_changed:
+    description: 'True if any service changed'
+    value: ${{ steps.build-matrix.outputs.any_changed }}
+  changed_list:
+    description: 'Comma-separated list of changed services'
+    value: ${{ steps.build-matrix.outputs.changed_list }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Build filter config
+      id: filters
+      shell: bash
+      run: |
+        SERVICES='${{ inputs.services }}'
+        SHARED='${{ inputs.shared_paths }}'
+        
+        # Build dorny/paths-filter YAML format
+        FILTERS=""
+        for svc in $(echo "$SERVICES" | jq -r 'keys[]'); do
+          PATHS=$(echo "$SERVICES" | jq -r --arg s "$svc" '.[$s][]')
+          FILTERS="${FILTERS}${svc}:"$'\n'
+          while IFS= read -r path; do
+            FILTERS="${FILTERS}  - '${path}'"$'\n'
+          done <<< "$PATHS"
+          
+          # Add shared paths
+          if [[ "$SHARED" != "[]" ]]; then
+            for spath in $(echo "$SHARED" | jq -r '.[]'); do
+              FILTERS="${FILTERS}  - '${spath}'"$'\n'
+            done
+          fi
+        done
+        
+        echo "filters<<EOF" >> $GITHUB_OUTPUT
+        echo "$FILTERS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Detect changes
+      uses: dorny/paths-filter@v3
+      id: changes
+      with:
+        filters: ${{ steps.filters.outputs.filters }}
+
+    - name: Build matrix output
+      id: build-matrix
+      shell: bash
+      run: |
+        SERVICES='${{ inputs.services }}'
+        CHANGES='${{ toJson(steps.changes.outputs) }}'
+        
+        MATRIX="[]"
+        SERVICES_JSON="{}"
+        CHANGED_LIST=""
+        ANY_CHANGED="false"
+        
+        for svc in $(echo "$SERVICES" | jq -r 'keys[]'); do
+          # Get change status from dorny output
+          CHANGED=$(echo "$CHANGES" | jq -r --arg s "$svc" '.[$s] // "false"')
+          
+          SERVICES_JSON=$(echo "$SERVICES_JSON" | jq --arg s "$svc" --argjson c "$CHANGED" '. + {($s): $c}')
+          
+          if [[ "$CHANGED" == "true" ]]; then
+            ANY_CHANGED="true"
+            MATRIX=$(echo "$MATRIX" | jq --arg s "$svc" '. + [$s]')
+            [[ -n "$CHANGED_LIST" ]] && CHANGED_LIST="${CHANGED_LIST},"
+            CHANGED_LIST="${CHANGED_LIST}${svc}"
+          fi
+        done
+        
+        echo "matrix=${MATRIX}" >> $GITHUB_OUTPUT
+        echo "services_json=${SERVICES_JSON}" >> $GITHUB_OUTPUT
+        echo "any_changed=${ANY_CHANGED}" >> $GITHUB_OUTPUT
+        echo "changed_list=${CHANGED_LIST}" >> $GITHUB_OUTPUT
+        
+        echo "📦 Changed services: ${CHANGED_LIST:-none}"

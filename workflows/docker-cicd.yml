@@ -1,0 +1,193 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Reusable Docker CI/CD Workflow
+# ═══════════════════════════════════════════════════════════════════════════════
+# Full CI/CD pipeline: detect changes → build → push → promote
+#
+# Usage in caller workflow:
+#   jobs:
+#     ci:
+#       uses: your-org/cicd-actions/.github/workflows/docker-cicd.yml@v1
+#       with:
+#         services: '{"api": ["backend/**"], "web": ["frontend/**"]}'
+#         image_prefix: ghcr.io/your-org
+#       secrets:
+#         registry_password: ${{ secrets.GITHUB_TOKEN }}
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Docker CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      # ─────────────────────────────────────────────────────────────────────────
+      # Services Configuration (Monorepo)
+      # ─────────────────────────────────────────────────────────────────────────
+      services:
+        description: 'JSON map of service name to paths (e.g., {"api": ["backend/**"]})'
+        required: true
+        type: string
+      shared_paths:
+        description: 'JSON array of paths that trigger all services'
+        required: false
+        type: string
+        default: '[]'
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # Registry Configuration
+      # ─────────────────────────────────────────────────────────────────────────
+      registry:
+        description: 'Container registry'
+        required: false
+        type: string
+        default: 'ghcr.io'
+      image_prefix:
+        description: 'Image prefix (e.g., ghcr.io/owner)'
+        required: true
+        type: string
+      registry_username:
+        description: 'Registry username (defaults to github.actor)'
+        required: false
+        type: string
+        default: ''
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # Build Configuration
+      # ─────────────────────────────────────────────────────────────────────────
+      context_prefix:
+        description: 'Path prefix for service contexts (e.g., "services/")'
+        required: false
+        type: string
+        default: ''
+      dockerfile:
+        description: 'Dockerfile name (relative to context)'
+        required: false
+        type: string
+        default: 'Dockerfile'
+      platforms:
+        description: 'Target platforms'
+        required: false
+        type: string
+        default: 'linux/amd64'
+      build_args:
+        description: 'Build arguments (newline separated)'
+        required: false
+        type: string
+        default: ''
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # Environment Configuration
+      # ─────────────────────────────────────────────────────────────────────────
+      enable_staging:
+        description: 'Enable staging promotion'
+        required: false
+        type: boolean
+        default: true
+      staging_environment:
+        description: 'GitHub environment name for staging'
+        required: false
+        type: string
+        default: 'staging'
+
+    secrets:
+      registry_password:
+        description: 'Registry password/token'
+        required: true
+
+    outputs:
+      changed_services:
+        description: 'JSON array of changed services'
+        value: ${{ jobs.detect.outputs.matrix }}
+      build_digest:
+        description: 'Build digest (if single service)'
+        value: ${{ jobs.build.outputs.digest }}
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # Detect Changed Services
+  # ═══════════════════════════════════════════════════════════════════════════════
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.changes.outputs.matrix }}
+      any_changed: ${{ steps.changes.outputs.any_changed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changes
+        id: changes
+        uses: ./actions/detect-changes
+        with:
+          services: ${{ inputs.services }}
+          shared_paths: ${{ inputs.shared_paths }}
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # Build & Push
+  # ═══════════════════════════════════════════════════════════════════════════════
+  build:
+    needs: detect
+    if: needs.detect.outputs.any_changed == 'true' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.detect.outputs.matrix) }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate metadata
+        id: meta
+        uses: ./actions/docker-metadata
+        with:
+          image_name: ${{ inputs.image_prefix }}/${{ matrix.service }}
+          tag_prefix: ''
+
+      - name: Build and push
+        id: build
+        uses: ./actions/docker-build
+        with:
+          context: ${{ inputs.context_prefix }}${{ matrix.service }}
+          dockerfile: ${{ inputs.dockerfile }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: ${{ inputs.platforms }}
+          build_args: |
+            VERSION=${{ github.sha }}
+            ${{ inputs.build_args }}
+          registry: ${{ inputs.registry }}
+          registry_username: ${{ inputs.registry_username || github.actor }}
+          registry_password: ${{ secrets.registry_password }}
+          cache_key: ${{ matrix.service }}
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # Promote to Staging
+  # ═══════════════════════════════════════════════════════════════════════════════
+  promote-staging:
+    needs: [detect, build]
+    if: |
+      inputs.enable_staging &&
+      github.ref == 'refs/heads/main' &&
+      needs.detect.outputs.any_changed == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.staging_environment }}
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Promote to staging
+        uses: ./actions/promote-image
+        with:
+          source_tag: ${{ inputs.image_prefix }}/${{ matrix.service }}:main-${{ github.sha }}
+          target_tag: ${{ inputs.image_prefix }}/${{ matrix.service }}:staging-${{ github.sha }}
+          registry: ${{ inputs.registry }}
+          registry_username: ${{ inputs.registry_username || github.actor }}
+          registry_password: ${{ secrets.registry_password }}

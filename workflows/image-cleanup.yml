@@ -1,0 +1,99 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Reusable Image Cleanup Workflow
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scheduled cleanup of container images based on retention policy
+#
+# Usage in caller workflow:
+#   on:
+#     schedule:
+#       - cron: '0 3 * * 0'  # Weekly
+#   jobs:
+#     cleanup:
+#       uses: your-org/cicd-actions/.github/workflows/image-cleanup.yml@v1
+#       with:
+#         images: '["api", "web", "worker"]'
+#         owner: your-org
+#       secrets:
+#         token: ${{ secrets.GITHUB_TOKEN }}
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Image Cleanup
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: 'JSON array of image names to clean up'
+        required: true
+        type: string
+      owner:
+        description: 'Package owner (user or org name)'
+        required: true
+        type: string
+      owner_type:
+        description: 'Owner type: user or org'
+        required: false
+        type: string
+        default: 'user'
+      retention_main:
+        description: 'Keep last N main branch images'
+        required: false
+        type: number
+        default: 20
+      retention_staging:
+        description: 'Keep last N staging images'
+        required: false
+        type: number
+        default: 10
+      retention_pr_days:
+        description: 'Delete PR images older than N days'
+        required: false
+        type: number
+        default: 7
+      dry_run:
+        description: 'Log without deleting'
+        required: false
+        type: boolean
+        default: false
+
+    secrets:
+      token:
+        description: 'GitHub token with packages:write'
+        required: true
+
+    outputs:
+      total_deleted:
+        description: 'Total images deleted across all packages'
+        value: ${{ jobs.cleanup.outputs.total_deleted }}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(inputs.images) }}
+    outputs:
+      total_deleted: ${{ steps.sum.outputs.total }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cleanup ${{ matrix.image }}
+        id: cleanup
+        uses: ./actions/cleanup-images
+        with:
+          image_name: ${{ matrix.image }}
+          owner: ${{ inputs.owner }}
+          owner_type: ${{ inputs.owner_type }}
+          token: ${{ secrets.token }}
+          retention_main: ${{ inputs.retention_main }}
+          retention_staging: ${{ inputs.retention_staging }}
+          retention_pr_days: ${{ inputs.retention_pr_days }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Report
+        run: |
+          echo "### 🗑️ Cleanup: ${{ matrix.image }}" >> $GITHUB_STEP_SUMMARY
+          echo "Deleted: ${{ steps.cleanup.outputs.deleted }} images" >> $GITHUB_STEP_SUMMARY

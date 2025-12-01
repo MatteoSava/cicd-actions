@@ -1,0 +1,210 @@
+name: 'Docker Metadata'
+description: 'Generate consistent Docker tags and labels based on Git context'
+author: 'Matteo Sava'
+
+branding:
+  icon: 'tag'
+  color: 'purple'
+
+inputs:
+  image_name:
+    description: 'Full image name including registry (e.g., ghcr.io/owner/app)'
+    required: true
+  tag_prefix:
+    description: 'Optional prefix for all tags (e.g., service name)'
+    required: false
+    default: ''
+  sha_length:
+    description: 'Length of Git SHA suffix'
+    required: false
+    default: '7'
+  # Tag templates with placeholders: {{number}}, {{sha}}, {{branch}}, {{version}}
+  tag_pr:
+    description: 'PR tag template (empty to disable)'
+    required: false
+    default: 'pr-{{number}}-{{sha}}'
+  tag_branch:
+    description: 'Branch tag template (empty to disable)'
+    required: false
+    default: '{{branch}}-{{sha}}'
+  tag_release_immutable:
+    description: 'Release immutable tag template'
+    required: false
+    default: 'v{{version}}-{{sha}}'
+  tag_release_floating:
+    description: 'Release floating tag template'
+    required: false
+    default: 'v{{version}}'
+  tag_release_minor:
+    description: 'Release major.minor floating tag'
+    required: false
+    default: 'v{{major}}.{{minor}}'
+  tag_latest:
+    description: 'Add latest tag on release (true/false)'
+    required: false
+    default: 'true'
+
+outputs:
+  tags:
+    description: 'Generated tags (newline separated, for docker/build-push-action)'
+    value: ${{ steps.generate.outputs.tags }}
+  labels:
+    description: 'OCI labels (newline separated)'
+    value: ${{ steps.generate.outputs.labels }}
+  version:
+    description: 'Primary version identifier'
+    value: ${{ steps.generate.outputs.version }}
+  primary_tag:
+    description: 'First/primary tag (for promotions)'
+    value: ${{ steps.generate.outputs.primary_tag }}
+  is_release:
+    description: 'True if this is a release tag'
+    value: ${{ steps.generate.outputs.is_release }}
+  json:
+    description: 'All metadata as JSON'
+    value: ${{ steps.generate.outputs.json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate metadata
+      id: generate
+      shell: bash
+      run: |
+        set -euo pipefail
+        
+        IMAGE="${{ inputs.image_name }}"
+        PREFIX="${{ inputs.tag_prefix }}"
+        SHA_LEN="${{ inputs.sha_length }}"
+        
+        SHA_SHORT=$(git rev-parse --short="$SHA_LEN" HEAD)
+        TAGS=""
+        VERSION=""
+        PRIMARY_TAG=""
+        IS_RELEASE="false"
+        
+        add_tag() {
+          local tag="$1"
+          [[ -n "$PREFIX" ]] && tag="${PREFIX}-${tag}"
+          local full="${IMAGE}:${tag}"
+          [[ -z "$PRIMARY_TAG" ]] && PRIMARY_TAG="$full"
+          [[ -n "$TAGS" ]] && TAGS="${TAGS}"$'\n'
+          TAGS="${TAGS}${full}"
+        }
+        
+        apply_template() {
+          local tmpl="$1"
+          tmpl="${tmpl//\{\{sha\}\}/$SHA_SHORT}"
+          tmpl="${tmpl//\{\{number\}\}/$PR_NUM}"
+          tmpl="${tmpl//\{\{branch\}\}/$BRANCH_SAFE}"
+          tmpl="${tmpl//\{\{version\}\}/$SEMVER}"
+          tmpl="${tmpl//\{\{major\}\}/$MAJOR}"
+          tmpl="${tmpl//\{\{minor\}\}/$MINOR}"
+          tmpl="${tmpl//\{\{patch\}\}/$PATCH}"
+          echo "$tmpl"
+        }
+        
+        # Initialize variables
+        PR_NUM=""
+        BRANCH_SAFE=""
+        SEMVER=""
+        MAJOR=""
+        MINOR=""
+        PATCH=""
+        
+        # Determine context and generate tags
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          # ═══ PR Context ═══
+          PR_NUM="${{ github.event.pull_request.number }}"
+          VERSION="pr-${PR_NUM}"
+          
+          if [[ -n "${{ inputs.tag_pr }}" ]]; then
+            TAG=$(apply_template "${{ inputs.tag_pr }}")
+            add_tag "$TAG"
+          fi
+          
+        elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          # ═══ Release Tag Context ═══
+          IS_RELEASE="true"
+          SEMVER="${GITHUB_REF#refs/tags/v}"
+          VERSION="${SEMVER}"
+          
+          # Parse semver
+          MAJOR=$(echo "$SEMVER" | cut -d. -f1)
+          MINOR=$(echo "$SEMVER" | cut -d. -f2)
+          PATCH=$(echo "$SEMVER" | cut -d. -f3 | cut -d- -f1)
+          
+          # Immutable tag (primary)
+          if [[ -n "${{ inputs.tag_release_immutable }}" ]]; then
+            TAG=$(apply_template "${{ inputs.tag_release_immutable }}")
+            add_tag "$TAG"
+          fi
+          
+          # Floating version tag
+          if [[ -n "${{ inputs.tag_release_floating }}" ]]; then
+            TAG=$(apply_template "${{ inputs.tag_release_floating }}")
+            add_tag "$TAG"
+          fi
+          
+          # Major.minor floating tag
+          if [[ -n "${{ inputs.tag_release_minor }}" ]]; then
+            TAG=$(apply_template "${{ inputs.tag_release_minor }}")
+            add_tag "$TAG"
+          fi
+          
+          # Latest tag
+          if [[ "${{ inputs.tag_latest }}" == "true" ]]; then
+            [[ -n "$PREFIX" ]] && add_tag "latest" || add_tag "latest"
+          fi
+          
+        else
+          # ═══ Branch Context ═══
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          BRANCH_SAFE="${BRANCH//\//-}"
+          VERSION="${BRANCH_SAFE}-${SHA_SHORT}"
+          
+          if [[ -n "${{ inputs.tag_branch }}" ]]; then
+            TAG=$(apply_template "${{ inputs.tag_branch }}")
+            add_tag "$TAG"
+          fi
+        fi
+        
+        # Generate OCI labels
+        LABELS="org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+        LABELS="${LABELS}"$'\n'"org.opencontainers.image.revision=${{ github.sha }}"
+        LABELS="${LABELS}"$'\n'"org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        LABELS="${LABELS}"$'\n'"org.opencontainers.image.version=${VERSION}"
+        [[ -n "${{ github.event.head_commit.message }}" ]] && \
+          LABELS="${LABELS}"$'\n'"org.opencontainers.image.description=$(echo '${{ github.event.head_commit.message }}' | head -n1 | cut -c1-100)"
+        
+        # Outputs
+        {
+          echo "tags<<EOF"
+          echo "$TAGS"
+          echo "EOF"
+          echo "labels<<EOF"
+          echo "$LABELS"
+          echo "EOF"
+          echo "version=${VERSION}"
+          echo "primary_tag=${PRIMARY_TAG}"
+          echo "is_release=${IS_RELEASE}"
+        } >> $GITHUB_OUTPUT
+        
+        # JSON output
+        JSON=$(jq -n \
+          --arg tags "$TAGS" \
+          --arg labels "$LABELS" \
+          --arg version "$VERSION" \
+          --arg primary "$PRIMARY_TAG" \
+          --argjson release "$IS_RELEASE" \
+          '{
+            tags: ($tags | split("\n") | map(select(. != ""))),
+            labels: ($labels | split("\n") | map(select(. != ""))),
+            version: $version,
+            primary_tag: $primary,
+            is_release: $release
+          }')
+        echo "json=${JSON}" >> $GITHUB_OUTPUT
+        
+        echo "🏷️  Generated tags:"
+        echo "$TAGS" | sed 's/^/   /'

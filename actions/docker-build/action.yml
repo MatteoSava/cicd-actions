@@ -1,0 +1,220 @@
+name: 'Docker Build & Push'
+description: 'Build and push Docker image with caching and best practices'
+author: 'Matteo Sava'
+
+branding:
+  icon: 'package'
+  color: 'orange'
+
+inputs:
+  # ═══════════════════════════════════════════════════════════════
+  # Build Configuration
+  # ═══════════════════════════════════════════════════════════════
+  context:
+    description: 'Build context path'
+    required: false
+    default: '.'
+  dockerfile:
+    description: 'Dockerfile path relative to context'
+    required: false
+    default: 'Dockerfile'
+  target:
+    description: 'Target build stage'
+    required: false
+    default: ''
+  platforms:
+    description: 'Target platforms (e.g., linux/amd64,linux/arm64)'
+    required: false
+    default: 'linux/amd64'
+  build_args:
+    description: 'Build arguments (newline separated KEY=VALUE)'
+    required: false
+    default: ''
+  secrets:
+    description: 'Build secrets (newline separated id=value)'
+    required: false
+    default: ''
+
+  # ═══════════════════════════════════════════════════════════════
+  # Image Configuration
+  # ═══════════════════════════════════════════════════════════════
+  tags:
+    description: 'Image tags (newline separated)'
+    required: true
+  labels:
+    description: 'Image labels (newline separated)'
+    required: false
+    default: ''
+  push:
+    description: 'Push image to registry'
+    required: false
+    default: 'true'
+  load:
+    description: 'Load image into local Docker (for single-platform builds)'
+    required: false
+    default: 'false'
+
+  # ═══════════════════════════════════════════════════════════════
+  # Registry Configuration
+  # ═══════════════════════════════════════════════════════════════
+  registry:
+    description: 'Registry to login (leave empty to skip login)'
+    required: false
+    default: ''
+  registry_username:
+    description: 'Registry username'
+    required: false
+    default: ''
+  registry_password:
+    description: 'Registry password/token'
+    required: false
+    default: ''
+
+  # ═══════════════════════════════════════════════════════════════
+  # Cache Configuration
+  # ═══════════════════════════════════════════════════════════════
+  cache_mode:
+    description: 'Cache mode: gha, registry, local, or none'
+    required: false
+    default: 'gha'
+  cache_key:
+    description: 'Cache key suffix for isolation (e.g., service name)'
+    required: false
+    default: ''
+  cache_registry_ref:
+    description: 'Registry ref for cache (when cache_mode=registry)'
+    required: false
+    default: ''
+
+  # ═══════════════════════════════════════════════════════════════
+  # Advanced Options
+  # ═══════════════════════════════════════════════════════════════
+  provenance:
+    description: 'Generate SLSA provenance attestation'
+    required: false
+    default: 'true'
+  sbom:
+    description: 'Generate SBOM attestation'
+    required: false
+    default: 'false'
+
+outputs:
+  digest:
+    description: 'Image digest (sha256:...)'
+    value: ${{ steps.build.outputs.digest }}
+  image_id:
+    description: 'Image ID'
+    value: ${{ steps.build.outputs.imageid }}
+  metadata:
+    description: 'Build metadata JSON'
+    value: ${{ steps.build.outputs.metadata }}
+  primary_tag:
+    description: 'First tag (for reference)'
+    value: ${{ steps.parse.outputs.primary_tag }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ─────────────────────────────────────────────────────────────
+    # Setup
+    # ─────────────────────────────────────────────────────────────
+    - name: Parse inputs
+      id: parse
+      shell: bash
+      run: |
+        PRIMARY_TAG=$(echo '${{ inputs.tags }}' | head -n1)
+        echo "primary_tag=${PRIMARY_TAG}" >> $GITHUB_OUTPUT
+
+    - name: Set up QEMU
+      if: contains(inputs.platforms, ',')
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # ─────────────────────────────────────────────────────────────
+    # Registry Login
+    # ─────────────────────────────────────────────────────────────
+    - name: Login to registry
+      if: inputs.registry != ''
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry_username }}
+        password: ${{ inputs.registry_password }}
+
+    # ─────────────────────────────────────────────────────────────
+    # Cache Configuration
+    # ─────────────────────────────────────────────────────────────
+    - name: Configure cache
+      id: cache
+      shell: bash
+      run: |
+        CACHE_KEY="${{ inputs.cache_key }}"
+        [[ -z "$CACHE_KEY" ]] && CACHE_KEY="docker"
+        
+        case "${{ inputs.cache_mode }}" in
+          gha)
+            echo "cache_from=type=gha,scope=${CACHE_KEY}" >> $GITHUB_OUTPUT
+            echo "cache_to=type=gha,mode=max,scope=${CACHE_KEY}" >> $GITHUB_OUTPUT
+            ;;
+          registry)
+            REF="${{ inputs.cache_registry_ref }}"
+            if [[ -z "$REF" ]]; then
+              # Use first tag with -cache suffix
+              REF=$(echo '${{ inputs.tags }}' | head -n1 | sed 's/:.*/:cache/')
+            fi
+            echo "cache_from=type=registry,ref=${REF}" >> $GITHUB_OUTPUT
+            echo "cache_to=type=registry,ref=${REF},mode=max" >> $GITHUB_OUTPUT
+            ;;
+          local)
+            echo "cache_from=type=local,src=/tmp/.buildx-cache-${CACHE_KEY}" >> $GITHUB_OUTPUT
+            echo "cache_to=type=local,dest=/tmp/.buildx-cache-${CACHE_KEY}-new,mode=max" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "cache_from=" >> $GITHUB_OUTPUT
+            echo "cache_to=" >> $GITHUB_OUTPUT
+            ;;
+        esac
+
+    # ─────────────────────────────────────────────────────────────
+    # Build & Push
+    # ─────────────────────────────────────────────────────────────
+    - name: Build and push
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+        target: ${{ inputs.target }}
+        platforms: ${{ inputs.platforms }}
+        push: ${{ inputs.push }}
+        load: ${{ inputs.load }}
+        tags: ${{ inputs.tags }}
+        labels: ${{ inputs.labels }}
+        build-args: ${{ inputs.build_args }}
+        secrets: ${{ inputs.secrets }}
+        cache-from: ${{ steps.cache.outputs.cache_from }}
+        cache-to: ${{ steps.cache.outputs.cache_to }}
+        provenance: ${{ inputs.provenance }}
+        sbom: ${{ inputs.sbom }}
+
+    # ─────────────────────────────────────────────────────────────
+    # Local Cache Rotation (for local cache mode)
+    # ─────────────────────────────────────────────────────────────
+    - name: Rotate local cache
+      if: inputs.cache_mode == 'local'
+      shell: bash
+      run: |
+        CACHE_KEY="${{ inputs.cache_key }}"
+        [[ -z "$CACHE_KEY" ]] && CACHE_KEY="docker"
+        rm -rf /tmp/.buildx-cache-${CACHE_KEY}
+        mv /tmp/.buildx-cache-${CACHE_KEY}-new /tmp/.buildx-cache-${CACHE_KEY} || true
+
+    - name: Summary
+      shell: bash
+      run: |
+        echo "🐳 Build complete"
+        echo "   Image: ${{ steps.parse.outputs.primary_tag }}"
+        echo "   Digest: ${{ steps.build.outputs.digest }}"
+        echo "   Pushed: ${{ inputs.push }}"

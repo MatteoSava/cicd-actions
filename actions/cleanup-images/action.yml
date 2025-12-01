@@ -1,0 +1,279 @@
+name: 'Cleanup Images'
+description: 'Apply retention policy to container images in GitHub Packages'
+author: 'Matteo Sava'
+
+branding:
+  icon: 'trash-2'
+  color: 'red'
+
+inputs:
+  # ═══════════════════════════════════════════════════════════════
+  # Package Configuration
+  # ═══════════════════════════════════════════════════════════════
+  image_name:
+    description: 'Image/package name (without registry prefix)'
+    required: true
+  owner:
+    description: 'Package owner (user or organization name)'
+    required: true
+  owner_type:
+    description: 'Owner type: user or org'
+    required: false
+    default: 'user'
+  token:
+    description: 'GitHub token with packages:write permission'
+    required: true
+
+  # ═══════════════════════════════════════════════════════════════
+  # Retention Policy
+  # ═══════════════════════════════════════════════════════════════
+  retention_release:
+    description: 'Keep release images (v*) forever (true/false)'
+    required: false
+    default: 'true'
+  retention_main:
+    description: 'Keep last N main/develop branch images'
+    required: false
+    default: '20'
+  retention_staging:
+    description: 'Keep last N staging images'
+    required: false
+    default: '10'
+  retention_pr_days:
+    description: 'Delete PR images older than N days'
+    required: false
+    default: '7'
+  retention_untagged_days:
+    description: 'Delete untagged images older than N days'
+    required: false
+    default: '1'
+
+  # ═══════════════════════════════════════════════════════════════
+  # Tag Patterns (customize if your convention differs)
+  # ═══════════════════════════════════════════════════════════════
+  pattern_release:
+    description: 'Regex pattern for release tags'
+    required: false
+    default: '^v[0-9]+\.[0-9]+\.[0-9]+'
+  pattern_main:
+    description: 'Prefix for main branch tags'
+    required: false
+    default: 'main-'
+  pattern_staging:
+    description: 'Prefix for staging tags'
+    required: false
+    default: 'staging-'
+  pattern_pr:
+    description: 'Prefix for PR tags'
+    required: false
+    default: 'pr-'
+
+  # ═══════════════════════════════════════════════════════════════
+  # Options
+  # ═══════════════════════════════════════════════════════════════
+  dry_run:
+    description: 'Log actions without deleting'
+    required: false
+    default: 'false'
+
+outputs:
+  deleted_count:
+    description: 'Number of image versions deleted'
+    value: ${{ steps.cleanup.outputs.deleted }}
+  summary:
+    description: 'JSON summary of cleanup results'
+    value: ${{ steps.cleanup.outputs.summary }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Cleanup images
+      id: cleanup
+      uses: actions/github-script@v7
+      env:
+        IMAGE_NAME: ${{ inputs.image_name }}
+        OWNER: ${{ inputs.owner }}
+        OWNER_TYPE: ${{ inputs.owner_type }}
+        RETENTION_RELEASE: ${{ inputs.retention_release }}
+        RETENTION_MAIN: ${{ inputs.retention_main }}
+        RETENTION_STAGING: ${{ inputs.retention_staging }}
+        RETENTION_PR_DAYS: ${{ inputs.retention_pr_days }}
+        RETENTION_UNTAGGED_DAYS: ${{ inputs.retention_untagged_days }}
+        PATTERN_RELEASE: ${{ inputs.pattern_release }}
+        PATTERN_MAIN: ${{ inputs.pattern_main }}
+        PATTERN_STAGING: ${{ inputs.pattern_staging }}
+        PATTERN_PR: ${{ inputs.pattern_pr }}
+        DRY_RUN: ${{ inputs.dry_run }}
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const image = process.env.IMAGE_NAME;
+          const owner = process.env.OWNER;
+          const ownerType = process.env.OWNER_TYPE;
+          const dryRun = process.env.DRY_RUN === 'true';
+          
+          const config = {
+            retentionRelease: process.env.RETENTION_RELEASE === 'true',
+            retentionMain: parseInt(process.env.RETENTION_MAIN),
+            retentionStaging: parseInt(process.env.RETENTION_STAGING),
+            retentionPrDays: parseInt(process.env.RETENTION_PR_DAYS),
+            retentionUntaggedDays: parseInt(process.env.RETENTION_UNTAGGED_DAYS),
+            patternRelease: new RegExp(process.env.PATTERN_RELEASE),
+            patternMain: process.env.PATTERN_MAIN,
+            patternStaging: process.env.PATTERN_STAGING,
+            patternPr: process.env.PATTERN_PR,
+          };
+          
+          const now = new Date();
+          const prCutoff = new Date(now - config.retentionPrDays * 24 * 60 * 60 * 1000);
+          const untaggedCutoff = new Date(now - config.retentionUntaggedDays * 24 * 60 * 60 * 1000);
+          
+          // API methods based on owner type
+          const isOrg = ownerType === 'org';
+          const getVersions = isOrg
+            ? github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg
+            : github.rest.packages.getAllPackageVersionsForPackageOwnedByUser;
+          const deleteVersion = isOrg
+            ? github.rest.packages.deletePackageVersionForOrg
+            : github.rest.packages.deletePackageVersionForUser;
+          
+          // Fetch all versions
+          let allVersions = [];
+          let page = 1;
+          const perPage = 100;
+          
+          try {
+            while (true) {
+              const params = {
+                package_type: 'container',
+                package_name: image,
+                per_page: perPage,
+                page: page,
+              };
+              params[isOrg ? 'org' : 'username'] = owner;
+              
+              const { data } = await getVersions(params);
+              if (data.length === 0) break;
+              allVersions = allVersions.concat(data);
+              if (data.length < perPage) break;
+              page++;
+            }
+          } catch (error) {
+            if (error.status === 404) {
+              console.log(`📦 Package '${image}' not found`);
+              core.setOutput('deleted', 0);
+              core.setOutput('summary', JSON.stringify({ error: 'Package not found' }));
+              return;
+            }
+            throw error;
+          }
+          
+          console.log(`📦 Found ${allVersions.length} versions of '${image}'`);
+          
+          // Categorize versions
+          const categorized = {
+            release: [],
+            main: [],
+            staging: [],
+            pr: [],
+            untagged: [],
+            other: [],
+          };
+          
+          for (const v of allVersions) {
+            const tags = v.metadata?.container?.tags || [];
+            const createdAt = new Date(v.created_at);
+            const versionData = { ...v, createdAt, tags };
+            
+            if (tags.length === 0) {
+              categorized.untagged.push(versionData);
+            } else if (tags.some(t => config.patternRelease.test(t))) {
+              categorized.release.push(versionData);
+            } else if (tags.some(t => t.startsWith(config.patternMain))) {
+              categorized.main.push(versionData);
+            } else if (tags.some(t => t.startsWith(config.patternStaging))) {
+              categorized.staging.push(versionData);
+            } else if (tags.some(t => t.startsWith(config.patternPr))) {
+              categorized.pr.push(versionData);
+            } else {
+              categorized.other.push(versionData);
+            }
+          }
+          
+          // Sort by date (newest first)
+          const sortByDate = (a, b) => b.createdAt - a.createdAt;
+          categorized.main.sort(sortByDate);
+          categorized.staging.sort(sortByDate);
+          categorized.pr.sort(sortByDate);
+          categorized.untagged.sort(sortByDate);
+          
+          // Determine what to delete
+          const toDelete = [];
+          const summary = {
+            release: { total: categorized.release.length, deleted: 0 },
+            main: { total: categorized.main.length, kept: 0, deleted: 0 },
+            staging: { total: categorized.staging.length, kept: 0, deleted: 0 },
+            pr: { total: categorized.pr.length, deleted: 0 },
+            untagged: { total: categorized.untagged.length, deleted: 0 },
+            other: { total: categorized.other.length, deleted: 0 },
+          };
+          
+          // Main: keep last N
+          const mainToDelete = categorized.main.slice(config.retentionMain);
+          summary.main.kept = Math.min(categorized.main.length, config.retentionMain);
+          summary.main.deleted = mainToDelete.length;
+          toDelete.push(...mainToDelete);
+          
+          // Staging: keep last N
+          const stagingToDelete = categorized.staging.slice(config.retentionStaging);
+          summary.staging.kept = Math.min(categorized.staging.length, config.retentionStaging);
+          summary.staging.deleted = stagingToDelete.length;
+          toDelete.push(...stagingToDelete);
+          
+          // PR: delete older than N days
+          const prToDelete = categorized.pr.filter(v => v.createdAt < prCutoff);
+          summary.pr.deleted = prToDelete.length;
+          toDelete.push(...prToDelete);
+          
+          // Untagged: delete older than N days
+          const untaggedToDelete = categorized.untagged.filter(v => v.createdAt < untaggedCutoff);
+          summary.untagged.deleted = untaggedToDelete.length;
+          toDelete.push(...untaggedToDelete);
+          
+          // Perform deletion
+          let deletedCount = 0;
+          for (const v of toDelete) {
+            const tagStr = v.tags.length > 0 ? v.tags.join(', ') : '(untagged)';
+            const age = Math.floor((now - v.createdAt) / (24 * 60 * 60 * 1000));
+            
+            if (dryRun) {
+              console.log(`🔍 [DRY RUN] Would delete: ${tagStr} (${age} days old)`);
+            } else {
+              try {
+                const deleteParams = {
+                  package_type: 'container',
+                  package_name: image,
+                  package_version_id: v.id,
+                };
+                deleteParams[isOrg ? 'org' : 'username'] = owner;
+                await deleteVersion(deleteParams);
+                console.log(`🗑️  Deleted: ${tagStr} (${age} days old)`);
+                deletedCount++;
+              } catch (error) {
+                console.log(`⚠️  Failed to delete ${tagStr}: ${error.message}`);
+              }
+            }
+          }
+          
+          // Summary
+          console.log('\n📊 Cleanup Summary:');
+          console.log(`   Release: ${summary.release.total} (kept forever)`);
+          console.log(`   Main: ${summary.main.kept} kept, ${summary.main.deleted} deleted`);
+          console.log(`   Staging: ${summary.staging.kept} kept, ${summary.staging.deleted} deleted`);
+          console.log(`   PR: ${summary.pr.deleted} deleted (older than ${config.retentionPrDays} days)`);
+          console.log(`   Untagged: ${summary.untagged.deleted} deleted`);
+          console.log(`   Other: ${summary.other.total} (untouched)`);
+          console.log(`\n✅ Total deleted: ${deletedCount}${dryRun ? ' (dry run)' : ''}`);
+          
+          core.setOutput('deleted', deletedCount);
+          core.setOutput('summary', JSON.stringify(summary));
