@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate action manifests
+        run: |
+          for f in actions/*/action.yml; do
+            echo "Checking $f ..."
+            python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" "$f"
+          done
+          echo "All action manifests are valid YAML."
+
+      - name: Shellcheck scripts
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: actions/
+          severity: warning
